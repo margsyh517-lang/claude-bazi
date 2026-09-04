@@ -182,9 +182,19 @@ def build_summary(cycles, recovery, sleep, workouts):
     else:
         today_date = datetime.now(timezone.utc).date().isoformat()
 
+    # Strain/workouts below belong to the cycle that just completed (roughly
+    # "yesterday"), NOT to `date` (today) -- WHOOP cycles run wake-to-wake,
+    # not midnight-to-midnight, so a consumer must not assume workouts_date
+    # == date.
+    if completed_cycle:
+        workouts_date = local_date(completed_cycle["start"], completed_cycle.get("timezone_offset", "+00:00"))
+    else:
+        workouts_date = None
+
     doc = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "date": today_date,
+        "workouts_date": workouts_date,
         "calibrating": bool(rec and rec.get("score", {}).get("user_calibrating")),
         "recovery_score": None,
         "hrv_ms": None,
@@ -316,14 +326,15 @@ def format_summary_text(doc):
         lines.append("睡眠 Sleep：暂无数据")
     lines.append("")
 
+    wd_label = f"（{doc['workouts_date']}，非今天）" if doc.get("workouts_date") else ""
     if doc["strain"] is not None:
-        lines.append(f"压力 Strain：{doc['strain']:.1f}" + (f"（{doc['calories_kcal']} 千卡）" if doc.get("calories_kcal") else ""))
+        lines.append(f"压力 Strain{wd_label}：{doc['strain']:.1f}" + (f"（{doc['calories_kcal']} 千卡）" if doc.get("calories_kcal") else ""))
     else:
-        lines.append("压力 Strain：暂无数据")
+        lines.append(f"压力 Strain{wd_label}：暂无数据")
     lines.append("")
 
     if doc["workouts"]:
-        lines.append(f"训练 Workouts（{len(doc['workouts'])}项）：")
+        lines.append(f"训练 Workouts{wd_label}（{len(doc['workouts'])}项）：")
         for w in doc["workouts"]:
             bits = [w["sport_name"] or "运动", f"{w['duration_min']:.0f}分钟"]
             if w.get("strain") is not None:
@@ -334,7 +345,7 @@ def format_summary_text(doc):
                 bits.append(f"{w['calories_kcal']} 千卡")
             lines.append("　· " + "，".join(bits))
     else:
-        lines.append("训练 Workouts：无记录")
+        lines.append(f"训练 Workouts{wd_label}：无记录")
 
     return "\n".join(lines)
 
