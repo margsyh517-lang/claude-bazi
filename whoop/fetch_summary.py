@@ -5,14 +5,16 @@ Fetch a daily WHOOP summary.
 Standard library only (no pip installs available in the automation
 environment). Reads WHOOP credentials from a local JSON file, refreshes
 the OAuth token, pulls the latest cycle/recovery/sleep/workout data from
-the WHOOP v2 API, and prints one JSON object to stdout:
+the WHOOP v2 API, upserts it into the user's own workout-tracker app's
+Supabase table (so the app can render it), and prints one JSON object to
+stdout:
 
-    {"new_creds": {...}, "summary_doc": {...}, "summary_text": "..."}
+    {"new_creds": {...}, "summary_doc": {...}, "summary_text": "...",
+     "app_sync_error": "..."}  # app_sync_error present only on failure
 
 The caller (a Claude Code session with access to the Artifact tool) is
 responsible for persisting new_creds and summary_doc to the artifact
-database and for delivering summary_text to the user -- this script only
-talks to WHOOP.
+database and for delivering summary_text to the user.
 
 Usage:
     python3 fetch_summary.py /path/to/creds.json
@@ -39,6 +41,17 @@ USER_AGENT = (
 )
 
 KJ_TO_KCAL = 0.239006
+
+# The user's existing workout-tracker app (Netlify + Supabase) stores its
+# data as {id, data} rows in a single "workout_data" table -- id="default_user"
+# holds the workout log, and this script upserts a second row,
+# id="whoop_data", holding {"YYYY-MM-DD": summary_doc, ...} so the app's UI
+# can render it. This anon key is already public (it ships in the app's
+# client-side JS), so shipping it here too adds no new exposure.
+SUPA_URL = "https://kcyznlqkmnmkzwwspbdm.supabase.co"
+SUPA_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtjeXpubHFrbW5ta3p3d3NwYmRtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg1MzY1ODEsImV4cCI6MjA5NDExMjU4MX0.9I7W-HPxiO6Y37SmIZQy1m0oFJsO9tk_Sd-5lAX-DvA"
+SUPA_WHOOP_ROW_ID = "whoop_data"
+SUPA_MAX_DAYS = 90
 
 
 def http_post_form(url, fields):
@@ -105,6 +118,45 @@ def local_date(iso_ts, tz_offset):
 
     dt_local = dt + sign * timedelta(hours=int(oh), minutes=int(om))
     return dt_local.date().isoformat()
+
+
+def supa_get_whoop_history():
+    req = urllib.request.Request(
+        f"{SUPA_URL}/rest/v1/workout_data?id=eq.{SUPA_WHOOP_ROW_ID}&select=data",
+        headers={"apikey": SUPA_KEY, "Authorization": f"Bearer {SUPA_KEY}", "User-Agent": USER_AGENT},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        rows = json.loads(resp.read().decode())
+    return rows[0]["data"] if rows and rows[0].get("data") else {}
+
+
+def supa_save_whoop_history(history_by_date):
+    body = json.dumps(
+        {"id": SUPA_WHOOP_ROW_ID, "data": history_by_date, "updated_at": datetime.now(timezone.utc).isoformat()}
+    ).encode()
+    req = urllib.request.Request(
+        f"{SUPA_URL}/rest/v1/workout_data",
+        data=body,
+        headers={
+            "apikey": SUPA_KEY,
+            "Authorization": f"Bearer {SUPA_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal,resolution=merge-duplicates",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.status
+
+
+def sync_to_app(summary_doc):
+    """Merge today's summary into the app's Supabase history row and upsert it."""
+    history = supa_get_whoop_history()
+    history[summary_doc["date"]] = summary_doc
+    keep_dates = sorted(history.keys(), reverse=True)[:SUPA_MAX_DAYS]
+    trimmed = {d: history[d] for d in keep_dates}
+    supa_save_whoop_history(trimmed)
 
 
 def fetch_whoop_data(access_token):
@@ -310,7 +362,16 @@ def main():
     summary_doc = build_summary(cycles, recovery, sleep, workouts)
     summary_text = format_summary_text(summary_doc)
 
-    print(json.dumps({"new_creds": new_creds, "summary_doc": summary_doc, "summary_text": summary_text}, ensure_ascii=False))
+    app_sync_error = None
+    try:
+        sync_to_app(summary_doc)
+    except Exception as e:
+        app_sync_error = str(e)
+
+    result = {"new_creds": new_creds, "summary_doc": summary_doc, "summary_text": summary_text}
+    if app_sync_error:
+        result["app_sync_error"] = app_sync_error
+    print(json.dumps(result, ensure_ascii=False))
 
 
 if __name__ == "__main__":
